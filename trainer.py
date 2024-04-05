@@ -1,85 +1,83 @@
 import os
+import time
+import csv
+import json
 from pathlib import Path
-from torchdata.datapipes.iter import IterableWrapper, FileOpener
+from datetime import datetime
+from torch import Tensor
 import configuration
-from ticker import Ticker
 
 class Trainer:
-	def __init__(self):
-		self.tickers = {}
+	FINANCIAL_STATEMENTS = "FinancialStatements"
+	KEY_RATIOS = "KeyRatios"
+	PRICE_DATA = "PriceData"
+
+	def __init__(self, options):
+		self._options = options
+		self._financial_statement_tensors = []
 
 	def run(self):
-		self.load_data_sets()
+		self._load_datasets()
 
-	def load_data_sets(self):
-		# self.load_financial_statements()
-		# self.load_key_ratios()
-		self.load_price_data()
+	def _load_datasets(self):
+		print("Loading datasets")
+		start = time.perf_counter()
+		paths = self._read_directory(Trainer.FINANCIAL_STATEMENTS)
+		self._financial_statement_tensors = []
+		for financial_statements_path in paths:
+			ticker = self._get_ticker_name(financial_statements_path)
+			print(f"Processing \"{ticker}\"")
+			key_ratios_path = self._get_data_file_path(Trainer.KEY_RATIOS, ticker, "json")
+			price_data_path = self._get_data_file_path(Trainer.PRICE_DATA, ticker, "csv")
+			if not os.path.isfile(key_ratios_path) or not os.path.isfile(price_data_path):
+				continue
+			valid = self._load_financial_statements(financial_statements_path)
+			self._load_key_ratios(key_ratios_path)
+			self._load_price_data(price_data_path)
+		end = time.perf_counter()
+		print(f"Loaded datasets in {end - start:0.1f} s")
 
-	def load_financial_statements(self):
-		json_files = self.parse_json_files("FinancialStatements")
-		for path_and_json in json_files:
-			name, financial_statements = self.get_path_and_json_name(path_and_json)
-			financial_statements = filter(Trainer.is_10_q_filing, financial_statements)
-			ticker = self.get_ticker(name)
-			ticker.financial_statements = financial_statements
-
-	def load_key_ratios(self):
-		json_files = self.parse_json_files("KeyRatios")
-		for path_and_json in json_files:
-			name, key_ratios = self.get_path_and_json_name(path_and_json)
-			ticker = self.get_ticker(name)
-			ticker.key_ratios = key_ratios
-
-	def load_price_data(self):
-		csv_files = self.parse_csv_files("PriceData")
-		current_ticker_name = None
-		ticker = None
-		for csv_path, row in csv_files:
-			ticker_name = self.get_ticker_name(csv_path)
-			if current_ticker_name != ticker_name:
-				ticker = self.get_ticker(ticker_name)
-				current_ticker_name = ticker_name
-				print(current_ticker_name)
-			ticker.add_price_data(row)
-
-	def get_ticker_name(self, file_path):
+	def _get_ticker_name(self, file_path):
 		path = Path(file_path)
 		return path.stem
 
-	def get_path_and_json_name(self, path_and_json):
-		name = self.get_ticker_name(path_and_json[0])
-		return name, path_and_json[1]
+	def _load_financial_statements(self, path):
+		with open(path) as file:
+			financial_statements = json.load(file)
+		financial_statements = filter(self._is_10_q_filing, financial_statements)
+		financial_statements = map(self._add_source_date, financial_statements)
+		financial_statements = filter(lambda fs: fs[0] is not None, financial_statements)
+		financial_statements = sorted(financial_statements, key=lambda fs: fs[0])
+		count = self._options.financial_statements
+		if len(financial_statements) < count:
+			return False
+		financial_statements = financial_statements[-count:]
+		for f in financial_statements:
+			date, financial_statement = f
+			self._get_financial_statement_tensor(financial_statement)
+		return True
 
-	def read_directory(self, directory):
+	def _load_key_ratios(self, path):
+		with open(path) as file:
+			key_ratios = json.load(file)
+		pass
+
+	def _load_price_data(self, path):
+		with open(path) as csv_file:
+			reader = csv.reader(csv_file, delimiter=",")
+			for row in reader:
+				pass
+
+	def _read_directory(self, directory):
 		path = os.path.join(configuration.DATA_PATH, directory)
 		files = os.listdir(path)
 		full_paths = map(lambda f: os.path.join(path, f), files)
 		return full_paths
 
-	def get_file_opener(self, directory):
-		paths = self.read_directory(directory)
-		iterable = IterableWrapper(paths)
-		file_opener = FileOpener(iterable, mode="b")
-		return file_opener
+	def _get_data_file_path(self, directory, ticker, extension):
+		return os.path.join(configuration.DATA_PATH, directory, f"{ticker}.{extension}")
 
-	def parse_json_files(self, directory):
-		file_opener = self.get_file_opener(directory)
-		json_files = file_opener.parse_json_files()
-		return json_files
-
-	def parse_csv_files(self, directory):
-		file_opener = self.get_file_opener(directory)
-		csv_files = file_opener.parse_csv(return_path=True)
-		return csv_files
-
-	def get_ticker(self, name):
-		if name not in self.tickers:
-			self.tickers[name] = Ticker()
-		return self.tickers[name]
-
-	@staticmethod
-	def is_10_q_filing(financial_statement):
+	def _is_10_q_filing(self, financial_statement):
 		def is_valid_source(target_key):
 			if target_key not in financial_statement:
 				return False
@@ -97,3 +95,277 @@ class Trainer:
 		for target in targets:
 			valid = valid and is_valid_source(target)
 		return valid
+
+	def _get_datetime(self, string):
+		year = int(string[0:4])
+		month = int(string[5:7])
+		day = int(string[8:10])
+		return datetime(year, month, day)
+
+	def _get_source_date(self, financial_statement):
+		source_date_string = financial_statement["balanceSheets"].get("sourceDate", None)
+		if source_date_string is None:
+			return None
+		return self._get_datetime(source_date_string)
+
+	def _add_source_date(self, financial_statement):
+		source_date = self._get_source_date(financial_statement)
+		return (source_date, financial_statement)
+
+	def _get_financial_statement_tensor(self, financial_statement):
+		def get_dict(key, dictionary):
+			return dictionary.get(key, {})
+
+		def add_values(keys, dictionary):
+			for key in keys:
+				value = dictionary.get(key, 0)
+				values.append(value)
+
+		balance_sheets = financial_statement["balanceSheets"]
+		cash_flow = financial_statement["cashFlow"]
+		income_statement = financial_statement["incomeStatement"]
+
+		current_assets = get_dict("currentAssets", balance_sheets)
+		long_term_assets = get_dict("longTermAssets", balance_sheets)
+		current_liabilities = get_dict("currentLiabilities", balance_sheets)
+		long_term_liabilities = get_dict("longTermLiabilities", balance_sheets)
+		equity = get_dict("equity", balance_sheets)
+
+		financing = get_dict("financing", cash_flow)
+		investing = get_dict("investing", cash_flow)
+		operating = get_dict("operating", cash_flow)
+
+		expense = get_dict("expense", income_statement)
+		income = get_dict("income", income_statement)
+		revenue = get_dict("revenue", income_statement)
+		cash = get_dict("cash", income_statement)
+
+		values = []
+
+		current_assets_keys = [
+			"accountsReceivableTradeNet",
+			"totalReceivablesNet",
+			"totalInventory",
+			"otherCurrentAssetsTotal",
+			"totalCurrentAssets",
+			"propertyPlantEquipmentTotalGross",
+			"accumulatedDepreciationTotal",
+			"intangiblesNet",
+			"longTermInvestments",
+			"totalAssets",
+			"shortTermInvestments",
+			"cashAndShortTermInvestments",
+			"cashEquivalents",
+			"goodwillNet",
+			"accountsReceivableTradeGross",
+			"receivablesOther",
+			"inventoriesFinishedGoods",
+			"inventoriesWorkInProgress",
+			"inventoriesRawMaterials",
+			"otherCurrentAssets",
+			"buildingsGross",
+			"landImprovementsGross",
+			"machineryEquipmentGross",
+			"otherPropertyPlantEquipmentGross",
+			"intangiblesGross",
+			"accumulatedIntangibleAmortization",
+			"ltInvestmentAffiliateCompanies",
+			"otherLongTermAssets",
+			"otherLongTermAssetsTotal",
+			"payableAccrued",
+			"accruedExpenses",
+			"propertyPlantEquipmentTotalNet"
+		]
+		add_values(current_assets_keys, current_assets)
+
+		long_term_assets_keys = [
+			"totalOperatingLeasesSupplemental",
+			"totalCurrentAssetsLessInventory",
+			"quickRatio",
+			"currentRatio",
+			"netDebtInclPrefStockMinInterest",
+			"tangibleBookValueCommonEquity",
+			"tangibleBookValuePerShareCommonEq"
+		]
+		add_values(long_term_assets_keys, long_term_assets)
+
+		current_liabilities_keys = [
+			"otherCurrentLiabilitiesTotal",
+			"totalCurrentLiabilities",
+			"longTermDebt",
+			"capitalLeaseObligations",
+			"totalDebt",
+			"totalLiabilities",
+			"notesPayableShortTermDebt",
+			"currentPortOfLTDebtCapitalLeases",
+			"incomeTaxesPayable",
+			"otherCurrentLiabilities",
+			"totalLongTermDebt",
+			"otherLongTermLiabilities",
+			"otherPayables",
+			"otherLiabilitiesTotal",
+			"accountsPayable"
+		]
+		add_values(current_liabilities_keys, current_liabilities)
+
+		long_term_liabilities_keys = [
+			"longTermDebtMaturingWithin1Year",
+			"longTermDebtMaturingInYear2",
+			"longTermDebtMaturingInYear3",
+			"longTermDebtMaturingInYear4",
+			"longTermDebtMaturingInYear5",
+			"longTermDebtMaturingIn2Or3Years",
+			"longTermDebtMaturingIn4Or5Years",
+			"longTermDebtMaturingInYear6AndBeyond",
+			"totalLongTermDebtSupplemental",
+			"operatingLeasePaymentsDueInYear1",
+			"operatingLeasePaymentsDueInYear2",
+			"operatingLeasePaymentsDueInYear3",
+			"operatingLeasePaymentsDueInYear4",
+			"operatingLeasePaymentsDueInYear5",
+			"operatingLeasePymtsDuein2Or3Years",
+			"operatingLeasePymtsDuein45Years",
+			"operatingLeasePaymentsDueInYear6AndBeyond"
+		]
+		add_values(long_term_liabilities_keys, long_term_liabilities)
+
+		equity_keys = [
+			"commonStockTotal",
+			"additionalPaidInCapital",
+			"retainedEarningsAccumulatedDeficit",
+			"unrealizedGainLoss",
+			"totalEquity",
+			"totalLiabilitiesShareholdersEquity",
+			"totalCommonSharesOutstanding",
+			"commonStock",
+			"otherComprehensiveIncome",
+			"otherEquityTotal",
+			"totalEquityMinorityInterest",
+			"sharesOutstandingCommonStockPrimaryIssue",
+			"treasurySharesCommonStockPrimaryIssue",
+			"accumulatedIntangibleAmortSuppl",
+			"translationAdjustment"
+		]
+		add_values(equity_keys, equity)
+
+		financing_keys = [
+			"totalCashDividendsPaid",
+			"issuanceRetirementOfDebtNet",
+			"cashFromFinancingActivities",
+			"otherFinancingCashFlow",
+			"financingCashFlowItems",
+			"cashDividendsPaidCommon",
+			"repurchaseRetirementOfCommon",
+			"commonStockNet",
+			"issuanceRetirementOfStockNet",
+			"longTermDebtIssued",
+			"longTermDebtReduction",
+			"longTermDebtNet"
+		]
+		add_values(financing_keys, financing)
+
+		investing_keys = [
+			"cashFromInvestingActivities",
+			"capitalExpenditures",
+			"purchaseOfFixedAssets",
+			"saleMaturityOfInvestment",
+			"purchaseOfInvestments",
+			"otherInvestingCashFlow",
+			"otherInvestingCashFlowItemsTotal",
+		]
+		add_values(investing_keys, investing)
+
+		operating_keys = [
+			"netIncomeStartingLine",
+			"depreciationDepletion",
+			"changesInWorkingCapital",
+			"cashFromOperatingActivities",
+			"netChangeInCash",
+			"foreignExchangeEffects",
+			"otherNonCashItems",
+			"nonCashItems",
+			"accountsReceivable",
+			"inventories",
+			"otherLiabilities",
+			"depreciationSupplemental",
+			"netCashBeginningBalance",
+			"netCashEndingBalance",
+			"payableAccrued"
+		]
+		add_values(operating_keys, operating)
+
+		expense_keys = [
+			"grossProfit",
+			"sellingGeneralAdminExpensesTotal",
+			"unusualExpenseIncome",
+			"researchDevelopment",
+			"restructuringCharge",
+			"interestExpenseSupplemental",
+			"depreciationSupplemental",
+			"amortizationOfIntangiblesSupplemental",
+			"stockBasedCompensationSupplemental",
+			"rentalExpenseSupplemental",
+			"researchDevelopmentExpSupplemental",
+			"sellingGeneralAdminExpenses",
+			"laborRelatedExpense",
+			"totalOperatingExpense"
+		]
+		add_values(expense_keys, expense)
+
+		income_keys = [
+			"incomeAvailableToComExclExtraOrd",
+			"incomeAvailableToComInclExtraOrd",
+			"provisionForIncomeTaxes",
+			"netIncomeBeforeTaxes",
+			"otherNet",
+			"netIncomeBeforeExtraItems",
+			"minorityInterest",
+			"operatingIncome",
+			"interestIncExpNetNonOpTotal",
+			"netInterestIncome",
+			"interestInvestIncomeNonOperating",
+			"otherNonOperatingIncomeExpense",
+			"interestExpenseNonOperating",
+			"incomeInclExtraBeforeDistributions",
+			"normalizedIncomeBeforeTaxes",
+			"incomeTaxExImpactOfSpeciaItems",
+			"normalizedIncomeAfterTaxes",
+			"normalizedIncAvailToCom",
+			"netIncomeAfterTaxes",
+			"investmentIncomeNonOperating",
+			"effectOfSpecialItemsOnIncomeTaxes",
+			"interestExpenseNetNonOperating",
+			"bankTotalRevenue"
+		]
+		add_values(income_keys, income)
+
+		revenue_keys = [
+			"opsCommonStockPrimaryIssue",
+			"costOfRevenueTotal",
+			"netSales",
+			"costOfRevenue",
+			"basicNormalizedEPS",
+			"dilutedNormalizedEPS",
+			"grossMargin",
+			"operatingMargin",
+			"normalizedEBIT",
+			"dilutedWeightedAverageShares",
+			"dilutedEPSExcludingExtraOrdItems",
+			"basicWeightedAverageShares",
+			"basicEPSExcludingExtraordinaryItems",
+			"basicEPSIncludingExtraordinaryItems",
+			"normalizedEBITDA",
+			"dilutedEPSIncludingExtraOrdItems",
+			"totalRevenue"
+		]
+		add_values(revenue_keys, revenue)
+
+		cash_keys = [
+			"investing",
+			"financing",
+			"total"
+		]
+		add_values(cash_keys, cash)
+
+		tensor = Tensor(values)
+		self._financial_statement_tensors.append(tensor)

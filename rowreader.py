@@ -20,4 +20,7 @@ class RowReader:
 
     def get_date(self):
         string = self.get_string()
-        return datetime.strptime(string, "%Y-%m-%d")
+        year = int(string[0:4])
+        month = int(string[5:7])
+        day = int(string[8:10])
+        return datetime(year, month, day)
