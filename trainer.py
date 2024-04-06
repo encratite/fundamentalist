@@ -6,6 +6,7 @@ from pathlib import Path
 from datetime import datetime
 from torch import Tensor
 import configuration
+from normalization import NormalizationTracker
 
 class Trainer:
 	FINANCIAL_STATEMENTS = "FinancialStatements"
@@ -15,12 +16,14 @@ class Trainer:
 	def __init__(self, options):
 		self._options = options
 		self._financial_statement_tensors = []
+		self._normalization_tracker = NormalizationTracker()
 
 	def run(self):
 		self._load_datasets()
 
 	def _load_datasets(self):
 		print("Loading datasets")
+		self._normalization_tracker = NormalizationTracker()
 		start = time.perf_counter()
 		paths = self._read_directory(Trainer.FINANCIAL_STATEMENTS)
 		self._financial_statement_tensors = []
@@ -35,6 +38,7 @@ class Trainer:
 			self._load_key_ratios(key_ratios_path)
 			self._load_price_data(price_data_path)
 		end = time.perf_counter()
+		self._normalization_tracker.normalize(self._financial_statement_tensors)
 		print(f"Loaded datasets in {end - start:0.1f} s")
 
 	def _get_ticker_name(self, file_path):
@@ -119,6 +123,7 @@ class Trainer:
 		def add_values(keys, dictionary):
 			for key in keys:
 				value = dictionary.get(key, 0)
+				self._normalization_tracker.handle_value(value)
 				values.append(value)
 
 		balance_sheets = financial_statement["balanceSheets"]
@@ -139,6 +144,8 @@ class Trainer:
 		income = get_dict("income", income_statement)
 		revenue = get_dict("revenue", income_statement)
 		cash = get_dict("cash", income_statement)
+
+		self._normalization_tracker.reset()
 
 		values = []
 
