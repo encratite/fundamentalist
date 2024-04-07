@@ -15,7 +15,7 @@ from normalization import NormalizationTracker
 class Trainer:
 	USE_GPU = True
 	RUN_LOADER_TEST = True
-	USE_CPROFILE = True
+	USE_CPROFILE = False
 
 	FINANCIAL_STATEMENTS = "FinancialStatements"
 	KEY_RATIOS = "KeyRatios"
@@ -107,7 +107,7 @@ class Trainer:
 				return None
 			return float(cell)
 
-		price_data = []
+		price_data = sortedcontainers.SortedKeyList(key=lambda x: x[0])
 		with open(path) as csv_file:
 			reader = csv.reader(csv_file, delimiter=",")
 			iter_reader = iter(reader)
@@ -118,20 +118,20 @@ class Trainer:
 				close_price = get_float(4, row)
 				if open_price is None or close_price is None:
 					continue
-				price_data.append((date, open_price, close_price))
+				price_data.add((date, open_price, close_price))
 		return price_data
 
 	def _get_price(self, date, price_data):
+		past = date - timedelta(days=4)
+		iter = price_data.irange_key(past, date)
 		previous = None
-		for p in price_data:
+		for p in iter:
 			price_date, open, close = p
 			current = (open, close)
 			if price_date == date:
 				return current
-			elif price_date > date:
-				return previous
 			previous = current
-		return None
+		return previous
 
 	def _process_new_data(self, price_data):
 		for data in self._new_data:
