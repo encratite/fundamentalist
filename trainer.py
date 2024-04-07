@@ -3,16 +3,20 @@ import sys
 import time
 import csv
 import json
+import sortedcontainers
 from pathlib import Path
 from datetime import datetime, timedelta
 import torch
-from torch import Tensor
 import torch.nn as nn
 import tqdm
 import configuration
 from normalization import NormalizationTracker
 
 class Trainer:
+	USE_GPU = True
+	RUN_LOADER_TEST = True
+	USE_CPROFILE = True
+
 	FINANCIAL_STATEMENTS = "FinancialStatements"
 	KEY_RATIOS = "KeyRatios"
 	PRICE_DATA = "PriceData"
@@ -32,13 +36,15 @@ class Trainer:
 	def _load_datasets(self):
 		print("Loading datasets")
 		self._normalization_tracker = NormalizationTracker()
-		start = time.perf_counter()
+		time1 = time.perf_counter()
 		paths = self._read_directory(Trainer.FINANCIAL_STATEMENTS)
 		self._new_data = []
 		self._training_input = []
 		self._test_input = []
 		self._training_labels = []
 		self._test_labels = []
+		if Trainer.RUN_LOADER_TEST:
+			paths = list(paths)[:50]
 		for financial_statements_path in paths:
 			ticker = self._get_ticker_name(financial_statements_path)
 			print(f"Processing \"{ticker}\"")
@@ -52,11 +58,15 @@ class Trainer:
 			# self._load_key_ratios(key_ratios_path)
 			price_data = self._load_price_data(price_data_path)
 			self._process_new_data(price_data)
-		end = time.perf_counter()
+		time2 = time.perf_counter()
 		self._normalization_tracker.normalize(self._training_input)
 		self._normalization_tracker.normalize(self._test_input)
-		print(f"Loaded datasets in {end - start:0.1f} s")
-		self._train_model()
+		self._print_perf_counter("Loaded datasets", time1, time2)
+		if not Trainer.USE_CPROFILE:
+			self._train_model()
+
+	def _print_perf_counter(self, description, start, end):
+		print(f"{description} in {end - start:0.1f} s")
 
 	def _get_ticker_name(self, file_path):
 		path = Path(file_path)
@@ -449,10 +459,13 @@ class Trainer:
 		return values
 
 	def _train_model(self):
-		training_input = Tensor(self._training_input)
-		test_input = Tensor(self._test_input)
-		training_labels = Tensor(self._training_labels)
-		test_labels = Tensor(self._test_labels)
+		print("Creating tensors")
+		device = "cuda" if Trainer.USE_GPU else "cpu"
+
+		training_input = torch.tensor(self._training_input, device=device)
+		test_input = torch.tensor(self._test_input, device=device)
+		training_labels = torch.tensor(self._training_labels, device=device)
+		test_labels = torch.tensor(self._test_labels, device=device)
 
 		self._training_input = []
 		self._test_input = []
@@ -466,14 +479,19 @@ class Trainer:
 			nn.ReLU(),
 			nn.Linear(gru_hidden_size, 1)
 		)
+		model.to(device)
 
 		loss_function = nn.MSELoss()
 		optimizer = torch.optim.Adam(model.parameters())
 
 		epochs = 50
-		batch_size = 8
+		batch_size = 256 * 1024
 		batch_start = torch.arange(0, len(training_input), batch_size)
 
+		test_loss = 0
+
+		print("Commencing training")
+		time1 = time.perf_counter()
 		for epoch in range(1, epochs + 1):
 			model.train()
 			with tqdm.tqdm(batch_start, unit="batch", mininterval=0) as bar:
@@ -487,8 +505,9 @@ class Trainer:
 					optimizer.zero_grad()
 					loss.backward()
 					optimizer.step()
-					bar.set_postfix(mse=float(loss))
+					bar.set_postfix(training_loss=float(loss), test_loss=test_loss)
 			model.eval()
-		prediction = torch.flatten(model(test_input))
-		loss = float(loss_function(prediction, test_labels))
-		print(f"MSE with test data: {loss:.3f}")
+			test_prediction = torch.flatten(model(test_input))
+			test_loss = float(loss_function(test_prediction, test_labels))
+		time2 = time.perf_counter()
+		self._print_perf_counter("Trained and evaluated model", time1, time2)

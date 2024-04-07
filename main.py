@@ -4,5 +4,7 @@ from options import TrainerOptions
 
 options = TrainerOptions()
 trainer = Trainer(options)
-# cProfile.run("trainer.run()")
-trainer.run()
+if Trainer.USE_CPROFILE:
+	cProfile.run("trainer.run()")
+else:
+	trainer.run()
