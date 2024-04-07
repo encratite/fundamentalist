@@ -1,10 +1,14 @@
 import os
+import sys
 import time
 import csv
 import json
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+import torch
 from torch import Tensor
+import torch.nn as nn
+import tqdm
 import configuration
 from normalization import NormalizationTracker
 
@@ -15,7 +19,11 @@ class Trainer:
 
 	def __init__(self, options):
 		self._options = options
-		self._financial_statement_tensors = []
+		self._new_data = []
+		self._training_input = []
+		self._test_input = []
+		self._training_labels = []
+		self._test_labels = []
 		self._normalization_tracker = NormalizationTracker()
 
 	def run(self):
@@ -26,7 +34,11 @@ class Trainer:
 		self._normalization_tracker = NormalizationTracker()
 		start = time.perf_counter()
 		paths = self._read_directory(Trainer.FINANCIAL_STATEMENTS)
-		self._financial_statement_tensors = []
+		self._new_data = []
+		self._training_input = []
+		self._test_input = []
+		self._training_labels = []
+		self._test_labels = []
 		for financial_statements_path in paths:
 			ticker = self._get_ticker_name(financial_statements_path)
 			print(f"Processing \"{ticker}\"")
@@ -34,12 +46,17 @@ class Trainer:
 			price_data_path = self._get_data_file_path(Trainer.PRICE_DATA, ticker, "csv")
 			if not os.path.isfile(key_ratios_path) or not os.path.isfile(price_data_path):
 				continue
-			valid = self._load_financial_statements(financial_statements_path)
-			self._load_key_ratios(key_ratios_path)
-			self._load_price_data(price_data_path)
+			has_data = self._load_financial_statements(financial_statements_path)
+			if not has_data:
+				continue
+			# self._load_key_ratios(key_ratios_path)
+			price_data = self._load_price_data(price_data_path)
+			self._process_new_data(price_data)
 		end = time.perf_counter()
-		self._normalization_tracker.normalize(self._financial_statement_tensors)
+		self._normalization_tracker.normalize(self._training_input)
+		self._normalization_tracker.normalize(self._test_input)
 		print(f"Loaded datasets in {end - start:0.1f} s")
+		self._train_model()
 
 	def _get_ticker_name(self, file_path):
 		path = Path(file_path)
@@ -50,15 +67,22 @@ class Trainer:
 			financial_statements = json.load(file)
 		financial_statements = filter(self._is_10_q_filing, financial_statements)
 		financial_statements = map(self._add_source_date, financial_statements)
-		financial_statements = filter(lambda fs: fs[0] is not None, financial_statements)
+		financial_statements = filter(lambda x: x[0] is not None, financial_statements)
 		financial_statements = sorted(financial_statements, key=lambda fs: fs[0])
 		count = self._options.financial_statements
 		if len(financial_statements) < count:
 			return False
-		financial_statements = financial_statements[-count:]
+		dated_features = []
 		for f in financial_statements:
 			date, financial_statement = f
-			self._get_financial_statement_tensor(financial_statement)
+			features = self._get_financial_statement_features(financial_statement)
+			dated_features.append((date, features))
+		for i in range(max(len(dated_features) - count, 0)):
+			j = i + count
+			batch = dated_features[i:j]
+			batch_date = batch[-1][0]
+			output = (batch_date, list(map(lambda x: x[1], batch))[0])
+			self._new_data.append(output)
 		return True
 
 	def _load_key_ratios(self, path):
@@ -67,10 +91,58 @@ class Trainer:
 		pass
 
 	def _load_price_data(self, path):
+		def get_float(i, row):
+			cell = row[i]
+			if cell == "null":
+				return None
+			return float(cell)
+
+		price_data = []
 		with open(path) as csv_file:
 			reader = csv.reader(csv_file, delimiter=",")
-			for row in reader:
-				pass
+			iter_reader = iter(reader)
+			next(iter_reader)
+			for row in iter_reader:
+				date = self._get_datetime(row[0])
+				open_price = get_float(1, row)
+				close_price = get_float(4, row)
+				if open_price is None or close_price is None:
+					continue
+				price_data.append((date, open_price, close_price))
+		return price_data
+
+	def _get_price(self, date, price_data):
+		previous = None
+		for p in price_data:
+			price_date, open, close = p
+			current = (open, close)
+			if price_date == date:
+				return current
+			elif price_date > date:
+				return previous
+			previous = current
+		return None
+
+	def _process_new_data(self, price_data):
+		for data in self._new_data:
+			batch_date, features = data
+			future_date = batch_date + timedelta(days=self._options.forecast_days)
+			price1 = self._get_price(batch_date, price_data)
+			price2 = self._get_price(future_date, price_data)
+			if price1 is None or price2 is None:
+				continue
+			open1, close1 = price1
+			open2, close2 = price2
+			if open1 == 0 or close1 == 0 or open2 == 0 or close2 == 0:
+				continue
+			label = close2 / open1 - 1.0
+			if batch_date < self._options.training_test_split_date:
+				self._training_input.append(features)
+				self._training_labels.append(label)
+			else:
+				self._test_input.append(features)
+				self._test_labels.append(label)
+		self._new_data = []
 
 	def _read_directory(self, directory):
 		path = os.path.join(configuration.DATA_PATH, directory)
@@ -116,7 +188,7 @@ class Trainer:
 		source_date = self._get_source_date(financial_statement)
 		return (source_date, financial_statement)
 
-	def _get_financial_statement_tensor(self, financial_statement):
+	def _get_financial_statement_features(self, financial_statement):
 		def get_dict(key, dictionary):
 			return dictionary.get(key, {})
 
@@ -374,5 +446,49 @@ class Trainer:
 		]
 		add_values(cash_keys, cash)
 
-		tensor = Tensor(values)
-		self._financial_statement_tensors.append(tensor)
+		return values
+
+	def _train_model(self):
+		training_input = Tensor(self._training_input)
+		test_input = Tensor(self._test_input)
+		training_labels = Tensor(self._training_labels)
+		test_labels = Tensor(self._test_labels)
+
+		self._training_input = []
+		self._test_input = []
+		self._training_labels = []
+		self._test_labels = []
+
+		features = training_input.shape[1]
+		gru_hidden_size = 128
+		model = nn.Sequential(
+			nn.GRUCell(features, gru_hidden_size),
+			nn.ReLU(),
+			nn.Linear(gru_hidden_size, 1)
+		)
+
+		loss_function = nn.MSELoss()
+		optimizer = torch.optim.Adam(model.parameters())
+
+		epochs = 50
+		batch_size = 8
+		batch_start = torch.arange(0, len(training_input), batch_size)
+
+		for epoch in range(1, epochs + 1):
+			model.train()
+			with tqdm.tqdm(batch_start, unit="batch", mininterval=0) as bar:
+				bar.set_description(f"Epoch {epoch}")
+				for start in bar:
+					offset = start + batch_size
+					input_batch = training_input[start:offset]
+					label_batch = training_labels[start:offset]
+					prediction = torch.flatten(model(input_batch))
+					loss = loss_function(prediction, label_batch)
+					optimizer.zero_grad()
+					loss.backward()
+					optimizer.step()
+					bar.set_postfix(mse=float(loss))
+			model.eval()
+		prediction = torch.flatten(model(test_input))
+		loss = float(loss_function(prediction, test_labels))
+		print(f"MSE with test data: {loss:.3f}")

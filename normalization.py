@@ -18,16 +18,16 @@ class NormalizationTracker:
     def reset(self):
         self._index = 0
 
-    def normalize(self, tensors):
+    def normalize(self, data):
         group_max = None
         for max_value in self._max_values:
             if group_max is None or max_value > group_max:
                 group_max = max_value
-        for tensor in tensors:
-            for i in range(len(tensor)):
+        for features in data:
+            for i in range(len(features)):
                 max_value = self._max_values[i]
                 divisor = max_value
                 if max_value >= self._group_limit:
                     divisor = max_value
                 if divisor > 0:
-                    tensor[i] /= divisor
+                    features[i] /= divisor
