@@ -29,6 +29,7 @@ class Trainer:
 		self._test_input = []
 		self._training_labels = []
 		self._test_labels = []
+		self._backtesting_data = []
 
 	def run(self):
 		self._load_datasets()
@@ -42,6 +43,7 @@ class Trainer:
 		self._test_input = []
 		self._training_labels = []
 		self._test_labels = []
+		self._backtesting_data = []
 		if Trainer.RUN_LOADER_TEST:
 			paths = list(paths)[:50]
 
@@ -53,14 +55,18 @@ class Trainer:
 		for result in results:
 			if result is None:
 				continue
-			training_input, training_labels, test_input, test_labels = result
+			training_input, training_labels, test_input, test_labels, backtesting_data = result
 			self._training_input.extend(training_input)
 			self._training_labels.extend(training_labels)
 			self._test_input.extend(test_input)
 			self._test_labels.extend(test_labels)
+			self._backtesting_data.extend(backtesting_data)
+			self._backtesting_data = sorted(self._backtesting_data, key=lambda x: x[0])
 
 		time2 = time.perf_counter()
 		self._print_perf_counter("Loaded datasets", time1, time2)
+
+		self._normalize()
 
 		if not Trainer.USE_CPROFILE:
 			self._train_model()
@@ -72,7 +78,7 @@ class Trainer:
 			return None
 		key_ratios = self._load_key_ratios(key_ratios_path)
 		price_data = self._load_price_data(price_data_path)
-		output = self._generate_datasets(key_ratios, price_data)
+		output = self._generate_datasets(ticker, key_ratios, price_data)
 		return output
 
 	def _print_perf_counter(self, description, start, end):
@@ -97,8 +103,11 @@ class Trainer:
 			for key in keys:
 				value = dictionary.get(key, 0)
 				if not isinstance(value, int) and not isinstance(value, float):
-					# raise Exception(f"Encountered an invalid value: \"{value}\"")
 					value = 0
+				limit = 1e3
+				if value > limit:
+					# print(f"Invalid value for key \"{key}\": {value}")
+					value = limit
 				values.append(value)
 
 		values = []
@@ -169,7 +178,7 @@ class Trainer:
 			previous = current
 		return previous
 
-	def _generate_datasets(self, key_ratios, price_data):
+	def _generate_datasets(self, ticker, key_ratios, price_data):
 		def get_performance(past, future):
 			return future / past - 1.0
 
@@ -177,6 +186,7 @@ class Trainer:
 		training_labels = []
 		test_input = []
 		test_labels = []
+		backtesting_data = []
 
 		for sample in key_ratios:
 			current_date, features = sample
@@ -208,7 +218,9 @@ class Trainer:
 			else:
 				test_input.append(features)
 				test_labels.append(label)
-		return training_input, training_labels, test_input, test_labels
+				backtest = (ticker, current_date, features, label)
+				backtesting_data.append(backtest)
+		return training_input, training_labels, test_input, test_labels, backtesting_data
 
 	def _read_directory(self, directory):
 		path = os.path.join(configuration.DATA_PATH, directory)
@@ -240,10 +252,21 @@ class Trainer:
 		date = self._get_end_date(metrics)
 		return (date, metrics)
 
-	def _normalize_tensor(self, tensor):
-		max = torch.max(torch.abs(tensor))
-		tensor /= max
-		return tensor
+	def _normalize(self):
+		print("Normalizing data")
+		time1 = time.perf_counter()
+
+		normalizer = Normalizer()
+		for datapoint in itertools.chain(self._training_input, self._test_input):
+			normalizer.reset()
+			for feature in datapoint:
+				normalizer.handle_value(feature)
+
+		normalizer.normalize(self._training_input)
+		normalizer.normalize(self._test_input)
+
+		time2 = time.perf_counter()
+		self._print_perf_counter("Normalized data", time1, time2)
 
 	def _train_model(self):
 		print("Creating tensors")
@@ -253,11 +276,6 @@ class Trainer:
 		test_input = torch.tensor(self._test_input, device=device)
 		training_labels = torch.tensor(self._training_labels, device=device)
 		test_labels = torch.tensor(self._test_labels, device=device)
-
-		print("Normalizing tensors")
-
-		training_input = self._normalize_tensor(training_input)
-		test_input = self._normalize_tensor(test_input)
 
 		self._training_input = []
 		self._test_input = []
@@ -271,9 +289,9 @@ class Trainer:
 		model.to(device)
 
 		loss_function = torch.nn.L1Loss()
-		optimizer = torch.optim.Adam(model.parameters())
+		optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, amsgrad=True)
 
-		epochs = 100
+		epochs = 1000
 		batch_size = 256 * 1024
 		batch_start = torch.arange(0, len(training_input), batch_size)
 
@@ -300,3 +318,40 @@ class Trainer:
 			test_loss = float(loss_function(test_prediction, test_labels))
 		time2 = time.perf_counter()
 		self._print_perf_counter("Trained and evaluated model", time1, time2)
+		self._backtest(model)
+
+	def _backtest(self, model):
+		print("Performing backtest")
+		initial_capital = 100000
+		money = initial_capital
+		portfolio_stocks = 5
+		fee = 10
+		now = self._backtesting_data[0][1]
+		while money > 20000:
+			future = now + datetime.timedelta(days=self._options.forecast_days)
+			available = list(filter(lambda x: x[1] >= now and x[1] < future, self._backtesting_data))
+			if len(available) == 0:
+				break
+			print(f"Updating portfolio on {now} with ${money:.2f} in the bank")
+			rated = []
+			for backtest in available:
+				ticker, current_date, features, label = backtest
+				input_tensor = torch.tensor(features, device="cuda")
+				rating = float(torch.flatten(model(input_tensor)))
+				entry = (ticker, current_date, rating, label)
+				rated.append(entry)
+			rated = sorted(rated, key=lambda x: x[2], reverse=True)
+			count = min(portfolio_stocks, len(rated))
+			buy = rated[0:count]
+			stake = money / count
+			for entry in buy:
+				ticker, current_date, rating, label = entry
+				gain = stake * label
+				if label > 0:
+					print(f"Gained ${gain:.2f} by investing in {ticker} (rating {rating:.4f})")
+				else:
+					print(f"Lost ${abs(gain):.2f} by investing in {ticker} (rating {rating:.4f})")
+				money += gain
+			money -= count * fee
+			now = future
+		print(f"Finished backtest with ${money:.2f} in the bank ({money / initial_capital - 1.0:+.2%})")
