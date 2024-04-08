@@ -1,20 +1,21 @@
 import os
-import sys
 import time
 import csv
 import json
 import sortedcontainers
-from pathlib import Path
-from datetime import datetime, timedelta
+import pathlib
+import datetime
+import itertools
 import torch
-import torch.nn as nn
 import tqdm
+import multiprocessing
 import configuration
-from normalization import NormalizationTracker
+from normalizer import Normalizer
+from transform import TransformOutput
 
 class Trainer:
 	USE_GPU = True
-	RUN_LOADER_TEST = True
+	RUN_LOADER_TEST = False
 	USE_CPROFILE = False
 
 	FINANCIAL_STATEMENTS = "FinancialStatements"
@@ -23,53 +24,67 @@ class Trainer:
 
 	def __init__(self, options):
 		self._options = options
-		self._new_data = []
 		self._training_input = []
 		self._test_input = []
 		self._training_labels = []
 		self._test_labels = []
-		self._normalization_tracker = NormalizationTracker()
 
 	def run(self):
 		self._load_datasets()
 
 	def _load_datasets(self):
 		print("Loading datasets")
-		self._normalization_tracker = NormalizationTracker()
 		time1 = time.perf_counter()
+
 		paths = self._read_directory(Trainer.FINANCIAL_STATEMENTS)
-		self._new_data = []
 		self._training_input = []
 		self._test_input = []
 		self._training_labels = []
 		self._test_labels = []
 		if Trainer.RUN_LOADER_TEST:
 			paths = list(paths)[:50]
-		for financial_statements_path in paths:
-			ticker = self._get_ticker_name(financial_statements_path)
-			print(f"Processing \"{ticker}\"")
-			key_ratios_path = self._get_data_file_path(Trainer.KEY_RATIOS, ticker, "json")
-			price_data_path = self._get_data_file_path(Trainer.PRICE_DATA, ticker, "csv")
-			if not os.path.isfile(key_ratios_path) or not os.path.isfile(price_data_path):
+
+		pool = multiprocessing.Pool(processes=configuration.LOADER_THREADS)
+		results = pool.map(self._run_thread, paths)
+		pool.close()
+		pool.join()
+
+		for result in results:
+			if result is None:
 				continue
-			has_data = self._load_financial_statements(financial_statements_path)
-			if not has_data:
-				continue
-			# self._load_key_ratios(key_ratios_path)
-			price_data = self._load_price_data(price_data_path)
-			self._process_new_data(price_data)
+			training_input, training_labels, test_input, test_labels = result
+			self._training_input.extend(training_input)
+			self._training_labels.extend(training_labels)
+			self._test_input.extend(test_input)
+			self._test_labels.extend(test_labels)
+
 		time2 = time.perf_counter()
-		self._normalization_tracker.normalize(self._training_input)
-		self._normalization_tracker.normalize(self._test_input)
 		self._print_perf_counter("Loaded datasets", time1, time2)
+
+		self._normalize()
 		if not Trainer.USE_CPROFILE:
 			self._train_model()
+
+	def _run_thread(self, financial_statements_path):
+		ticker = self._get_ticker_name(financial_statements_path)
+		# print(f"Processing \"{ticker}\"")
+		key_ratios_path = self._get_data_file_path(Trainer.KEY_RATIOS, ticker, "json")
+		price_data_path = self._get_data_file_path(Trainer.PRICE_DATA, ticker, "csv")
+		if not os.path.isfile(key_ratios_path) or not os.path.isfile(price_data_path):
+			return None
+		fundamental_data = self._load_financial_statements(financial_statements_path)
+		if fundamental_data is None:
+			return None
+		# self._load_key_ratios(key_ratios_path)
+		price_data = self._load_price_data(price_data_path)
+		output = self._split_data(fundamental_data, price_data)
+		return output
 
 	def _print_perf_counter(self, description, start, end):
 		print(f"{description} in {end - start:0.1f} s")
 
 	def _get_ticker_name(self, file_path):
-		path = Path(file_path)
+		path = pathlib.Path(file_path)
 		return path.stem
 
 	def _load_financial_statements(self, path):
@@ -81,19 +96,20 @@ class Trainer:
 		financial_statements = sorted(financial_statements, key=lambda fs: fs[0])
 		count = self._options.financial_statements
 		if len(financial_statements) < count:
-			return False
+			return None
 		dated_features = []
 		for f in financial_statements:
 			date, financial_statement = f
 			features = self._get_financial_statement_features(financial_statement)
 			dated_features.append((date, features))
+		output = []
 		for i in range(max(len(dated_features) - count, 0)):
 			j = i + count
 			batch = dated_features[i:j]
 			batch_date = batch[-1][0]
-			output = (batch_date, list(map(lambda x: x[1], batch))[0])
-			self._new_data.append(output)
-		return True
+			new_data = (batch_date, list(map(lambda x: x[1], batch)))
+			output.append(new_data)
+		return output
 
 	def _load_key_ratios(self, path):
 		with open(path) as file:
@@ -122,7 +138,7 @@ class Trainer:
 		return price_data
 
 	def _get_price(self, date, price_data):
-		past = date - timedelta(days=4)
+		past = date - datetime.timedelta(days=4)
 		iter = price_data.irange_key(past, date)
 		previous = None
 		for p in iter:
@@ -133,10 +149,14 @@ class Trainer:
 			previous = current
 		return previous
 
-	def _process_new_data(self, price_data):
-		for data in self._new_data:
-			batch_date, features = data
-			future_date = batch_date + timedelta(days=self._options.forecast_days)
+	def _split_data(self, fundamental_data, price_data):
+		training_input = []
+		training_labels = []
+		test_input = []
+		test_labels = []
+		for sample in fundamental_data:
+			batch_date, features = sample
+			future_date = batch_date + datetime.timedelta(days=self._options.forecast_days)
 			price1 = self._get_price(batch_date, price_data)
 			price2 = self._get_price(future_date, price_data)
 			if price1 is None or price2 is None:
@@ -147,12 +167,12 @@ class Trainer:
 				continue
 			label = close2 / open1 - 1.0
 			if batch_date < self._options.training_test_split_date:
-				self._training_input.append(features)
-				self._training_labels.append(label)
+				training_input.append(features)
+				training_labels.append(label)
 			else:
-				self._test_input.append(features)
-				self._test_labels.append(label)
-		self._new_data = []
+				test_input.append(features)
+				test_labels.append(label)
+		return training_input, training_labels, test_input, test_labels
 
 	def _read_directory(self, directory):
 		path = os.path.join(configuration.DATA_PATH, directory)
@@ -186,7 +206,7 @@ class Trainer:
 		year = int(string[0:4])
 		month = int(string[5:7])
 		day = int(string[8:10])
-		return datetime(year, month, day)
+		return datetime.datetime(year, month, day)
 
 	def _get_source_date(self, financial_statement):
 		source_date_string = financial_statement["balanceSheets"].get("sourceDate", None)
@@ -205,7 +225,6 @@ class Trainer:
 		def add_values(keys, dictionary):
 			for key in keys:
 				value = dictionary.get(key, 0)
-				self._normalization_tracker.handle_value(value)
 				values.append(value)
 
 		balance_sheets = financial_statement["balanceSheets"]
@@ -226,8 +245,6 @@ class Trainer:
 		income = get_dict("income", income_statement)
 		revenue = get_dict("revenue", income_statement)
 		cash = get_dict("cash", income_statement)
-
-		self._normalization_tracker.reset()
 
 		values = []
 
@@ -458,6 +475,36 @@ class Trainer:
 
 		return values
 
+	def _normalize(self):
+		def get_chain():
+			return itertools.chain(self._training_input, self._test_input)
+
+		def flatten(input):
+			output = []
+			for element in input:
+				output.extend(element)
+			return output
+
+		def flatten_input(dataset):
+			return list(map(flatten, dataset))
+
+		print("Normalizing data")
+		time1 = time.perf_counter()
+
+		normalizer = Normalizer()
+		for datapoint in get_chain():
+			for features in datapoint:
+				normalizer.reset()
+				for feature in features:
+					normalizer.handle_value(feature)
+		for datapoint in get_chain():
+			normalizer.normalize(datapoint)
+		self._training_input = flatten_input(self._training_input)
+		self._test_input = flatten_input(self._test_input)
+
+		time2 = time.perf_counter()
+		self._print_perf_counter("Normalized data", time1, time2)
+
 	def _train_model(self):
 		print("Creating tensors")
 		device = "cuda" if Trainer.USE_GPU else "cpu"
@@ -473,15 +520,18 @@ class Trainer:
 		self._test_labels = []
 
 		features = training_input.shape[1]
-		gru_hidden_size = 128
-		model = nn.Sequential(
-			nn.GRUCell(features, gru_hidden_size),
-			nn.ReLU(),
-			nn.Linear(gru_hidden_size, 1)
+		model = torch.nn.Sequential(
+			torch.nn.LSTMCell(features, 256),
+			TransformOutput(),
+			torch.nn.ReLU(),
+			torch.nn.LSTMCell(256, 128),
+			TransformOutput(),
+			torch.nn.ReLU(),
+			torch.nn.Linear(128, 1)
 		)
 		model.to(device)
 
-		loss_function = nn.MSELoss()
+		loss_function = torch.nn.MSELoss()
 		optimizer = torch.optim.Adam(model.parameters())
 
 		epochs = 50
@@ -490,7 +540,7 @@ class Trainer:
 
 		test_loss = 0
 
-		print("Commencing training")
+		print(f"Commencing training for {features} features")
 		time1 = time.perf_counter()
 		for epoch in range(1, epochs + 1):
 			model.train()

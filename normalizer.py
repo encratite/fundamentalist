@@ -1,6 +1,6 @@
 import math
 
-class NormalizationTracker:
+class Normalizer:
     def __init__(self, group_limit = 10000):
         self._index = 0
         self._max_values = []
